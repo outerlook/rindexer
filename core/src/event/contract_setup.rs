@@ -240,7 +240,7 @@ impl FactoryDetails {
 pub struct FilterDetails {
     pub events: ValueOrArray<String>,
 
-    pub indexed_filters: Option<EventInputIndexedFilters>,
+    pub indexed_filters: Option<Vec<EventInputIndexedFilters>>,
 }
 
 #[derive(Clone)]

@@ -615,7 +615,32 @@ impl JsonRpcCachedProvider {
         let duration = start.elapsed().as_secs_f64();
         rpc_metrics::record_rpc_request(&network, "eth_getLogs", logs.is_ok(), duration);
 
-        logs
+        // If there are additional topic sets (multiple indexed_filters that can't be expressed
+        // as a single eth_getLogs query), make extra calls and merge results.
+        let additional = event_filter.additional_topics();
+        if additional.is_empty() {
+            return logs;
+        }
+
+        let mut all_logs = logs?;
+        for extra_topics in additional {
+            let extra_filter = Filter::new()
+                .event_signature(event_filter.event_signature())
+                .topic1(extra_topics[1].clone())
+                .topic2(extra_topics[2].clone())
+                .topic3(extra_topics[3].clone())
+                .from_block(event_filter.from_block())
+                .to_block(event_filter.to_block());
+            let extra_logs = self.provider.get_logs(&extra_filter).await?;
+            all_logs.extend(extra_logs);
+        }
+
+        // Dedup logs that may appear in multiple filter results (e.g., self-transfers)
+        let mut seen = HashSet::new();
+        all_logs.retain(|log| seen.insert((log.block_number, log.log_index)));
+        all_logs.sort_by_key(|log| (log.block_number.unwrap_or(0), log.log_index.unwrap_or(0)));
+
+        Ok(all_logs)
     }
 
     /// Get logs by chunking addresses and fetching asynchronously in batches

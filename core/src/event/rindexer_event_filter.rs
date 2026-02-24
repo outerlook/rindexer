@@ -24,6 +24,10 @@ pub struct SimpleEventFilter {
     pub address: Option<ValueOrArray<Address>>,
     pub topic_id: B256,
     pub topics: [Topic; 4],
+    /// Extra topic sets for filters that can't be expressed as a single eth_getLogs query.
+    /// Each entry represents an additional eth_getLogs call needed (e.g., OR across different
+    /// indexed positions like "from=X OR to=X" for Transfer events).
+    pub additional_topics: Vec<[Topic; 4]>,
     pub current_block: U64,
     pub next_block: U64,
 }
@@ -148,6 +152,7 @@ impl RindexerEventFilter {
             topics: index_filter
                 .map(|indexed_filter| indexed_filter.clone().into())
                 .unwrap_or_default(),
+            additional_topics: vec![],
             current_block,
             next_block,
         }))
@@ -160,14 +165,21 @@ impl RindexerEventFilter {
         current_block: U64,
         next_block: U64,
     ) -> Result<RindexerEventFilter, BuildRindexerFilterError> {
+        let filters = filter_details.indexed_filters.clone().unwrap_or_default();
+        let (topics, additional_topics) = if filters.is_empty() {
+            (Default::default(), vec![])
+        } else {
+            let mut iter = filters.into_iter();
+            let first: [Topic; 4] = iter.next().unwrap().into();
+            let rest: Vec<[Topic; 4]> = iter.map(Into::into).collect();
+            (first, rest)
+        };
+
         Ok(RindexerEventFilter::Filter(SimpleEventFilter {
             address: None,
             topic_id: *topic_id,
-            topics: filter_details
-                .clone()
-                .indexed_filters
-                .map(|indexed_filter| indexed_filter.clone().into())
-                .unwrap_or_default(),
+            topics,
+            additional_topics,
             current_block,
             next_block,
         }))
@@ -178,6 +190,15 @@ impl RindexerEventFilter {
             RindexerEventFilter::Address(filter) => filter.topic_id,
             RindexerEventFilter::Filter(filter) => filter.topic_id,
             RindexerEventFilter::Factory(filter) => filter.topic_id,
+        }
+    }
+
+    pub fn additional_topics(&self) -> &[[Topic; 4]] {
+        match self {
+            RindexerEventFilter::Address(filter) | RindexerEventFilter::Filter(filter) => {
+                &filter.additional_topics
+            }
+            RindexerEventFilter::Factory(_) => &[],
         }
     }
 

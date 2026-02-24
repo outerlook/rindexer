@@ -136,13 +136,13 @@ impl ContractDetails {
             match filter {
                 ValueOrArray::Value(filter) => IndexingContractSetup::Filter(FilterDetails {
                     events: ValueOrArray::Value(filter.event_name.clone()),
-                    indexed_filters: self.indexed_filters.as_ref().and_then(|f| f.first().cloned()),
+                    indexed_filters: self.indexed_filters.clone(),
                 }),
                 ValueOrArray::Array(filters) => IndexingContractSetup::Filter(FilterDetails {
                     events: ValueOrArray::Array(
                         filters.iter().map(|f| f.event_name.clone()).collect(),
                     ),
-                    indexed_filters: self.indexed_filters.as_ref().and_then(|f| f.first().cloned()),
+                    indexed_filters: self.indexed_filters.clone(),
                 }),
             }
         } else {
