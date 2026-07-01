@@ -134,6 +134,11 @@ pub async fn native_transfer_block_fetch(
             break Ok(());
         }
 
+        // Pace the poll loop so a head-following fetch (end_block = None) doesn't
+        // spin the CPU when the chain tip is idle — get_latest_block is cached, so
+        // without this the loop busy-waits between cache refreshes.
+        sleep(Duration::from_millis(200)).await;
+
         let latest_block = publisher.get_latest_block().await;
 
         match latest_block {

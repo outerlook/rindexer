@@ -173,9 +173,20 @@ async fn start_indexing_traces(
     clickhouse: Option<Arc<ClickhouseClient>>,
     indexer: &Indexer,
     trace_registry: Arc<TraceCallbackRegistry>,
+    no_live_indexing_forced: bool,
 ) -> Result<Vec<JoinHandle<Result<(), ProcessEventError>>>, StartIndexingError> {
     if !manifest.native_transfers.enabled {
         info!("Native transfer indexing disabled!");
+        return Ok(vec![]);
+    }
+
+    // Historical pass defers to the live pass to avoid double-spawning the NT
+    // pipeline (and to keep the historical join from waiting on a head-following
+    // fetch that never ends — issue #367). But when no live pass will follow
+    // (e.g. every contract and NT network has an end_block), this IS NT's only
+    // chance to run — so fall through and spawn it here.
+    if no_live_indexing_forced && manifest.has_any_live_indexing() {
+        info!("Native transfer indexing deferred to live pass to prevent double-spawn");
         return Ok(vec![]);
     }
 
@@ -259,11 +270,16 @@ async fn start_indexing_traces(
             stream_last_synced_block_file_path: None,
         });
 
+        // Pass the manifest's end_block (not the calculated one): `None` means
+        // live-follow the chain head forever, which is the whole point of the
+        // NT pipeline running in the live pass. A calculated end (= latest at
+        // startup) would terminate the fetch seconds after boot and silently
+        // stop native-transfer indexing.
         let block_fetch_handle = tokio::spawn(native_transfer_block_fetch(
             network_details.cached_provider.clone(),
             block_tx,
             start_block,
-            Some(end_block),
+            network_details.end_block,
             indexing_distance_from_head,
             network_name.clone(),
         ));
@@ -596,7 +612,8 @@ async fn start_indexing(
             database.clone(),
             clickhouse.clone(),
             &indexer,
-            trace_registry.clone()
+            trace_registry.clone(),
+            no_live_indexing_forced
         ),
         start_indexing_contract_events(
             manifest,
