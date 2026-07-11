@@ -21,7 +21,7 @@ use crate::{
         generate::generate_indexer_contract_schema_name,
         postgres::generate::generate_internal_event_table_name,
     },
-    event::config::{EventProcessingConfig, TraceProcessingConfig},
+    event::config::{EventProcessingConfig, TraceProcessingConfig, LEGACY_DETAIL_KEY},
     helpers::get_full_path,
     manifest::{storage::CsvDetails, stream::StreamsConfig},
     metrics::indexing as metrics,
@@ -88,9 +88,40 @@ pub struct SyncConfig<'a> {
     pub contract_name: &'a str,
     pub event_name: &'a str,
     pub network: &'a str,
+    pub detail_key: &'a str,
+}
+
+fn postgres_cursor_select_query(table_name: &str) -> String {
+    format!(
+        "SELECT last_synced_block FROM rindexer_internal.{table_name} WHERE network = $1 AND detail_key = $2"
+    )
+}
+
+fn postgres_cursor_seed_query(table_name: &str) -> String {
+    format!(
+        "INSERT INTO rindexer_internal.{table_name} (network, detail_key, last_synced_block) VALUES ($1, $2, $3) ON CONFLICT (network, detail_key) DO NOTHING"
+    )
+}
+
+fn postgres_cursor_upsert_query(table_name: &str) -> String {
+    format!(
+        "INSERT INTO rindexer_internal.{table_name} (network, detail_key, last_synced_block) VALUES ($1, $2, $3) ON CONFLICT (network, detail_key) DO UPDATE SET last_synced_block = GREATEST(rindexer_internal.{table_name}.last_synced_block, EXCLUDED.last_synced_block)"
+    )
+}
+
+#[derive(Debug, PartialEq)]
+struct LegacyCursorFallback {
+    resume_from: Option<U64>,
+    seed: U64,
+}
+
+fn legacy_cursor_fallback(block: U64) -> LegacyCursorFallback {
+    LegacyCursorFallback { resume_from: (!block.is_zero()).then_some(block), seed: block }
 }
 
 pub async fn get_last_synced_block_number(config: SyncConfig<'_>) -> Option<U64> {
+    // File-backed cursors remain event-scoped because public detail keys can exceed portable
+    // filename component limits.
     // Check CSV file for last seen block as no database enabled
     if config.postgres.is_none() && config.contract_csv_enabled {
         if let Some(csv_details) = config.csv_details {
@@ -158,29 +189,68 @@ pub async fn get_last_synced_block_number(config: SyncConfig<'_>) -> Option<U64>
         let schema =
             generate_indexer_contract_schema_name(config.indexer_name, config.contract_name);
         let table_name = generate_internal_event_table_name(&schema, config.event_name);
-        let query = format!(
-            "SELECT last_synced_block FROM rindexer_internal.{table_name} WHERE network = $1"
-        );
+        let query = postgres_cursor_select_query(&table_name);
 
-        return match postgres.query_one(&query, &[&config.network]).await {
-            Ok(row) => {
-                let result: Decimal = row.get("last_synced_block");
-                let parsed =
-                    U64::from_str(&result.to_string()).expect("Failed to parse last_synced_block");
-                if parsed.is_zero() {
-                    None
-                } else {
-                    Some(parsed)
+        let read_cursor = |row: tokio_postgres::Row| {
+            let result: Decimal = row.get("last_synced_block");
+            let parsed =
+                U64::from_str(&result.to_string()).expect("Failed to parse last_synced_block");
+            (!parsed.is_zero()).then_some(parsed)
+        };
+
+        return match postgres
+            .query_one_or_none(&query, &[&config.network, &config.detail_key])
+            .await
+        {
+            Ok(Some(row)) => read_cursor(row),
+            Ok(None) if config.detail_key != LEGACY_DETAIL_KEY => {
+                let legacy_row = postgres
+                    .query_one_or_none(&query, &[&config.network, &LEGACY_DETAIL_KEY])
+                    .await;
+                match legacy_row {
+                    Ok(Some(row)) => {
+                        let legacy_value: Decimal = row.get("last_synced_block");
+                        let legacy_block = U64::from_str(&legacy_value.to_string())
+                            .expect("Failed to parse legacy last_synced_block");
+                        let fallback = legacy_cursor_fallback(legacy_block);
+                        let seed = EthereumSqlTypeWrapper::U64(fallback.seed.to());
+                        let seed_query = postgres_cursor_seed_query(&table_name);
+                        if let Err(error) = postgres
+                            .execute(&seed_query, &[&config.network, &config.detail_key, &seed])
+                            .await
+                        {
+                            error!("Error seeding detail cursor from legacy row: {:?}", error);
+                        }
+
+                        match postgres
+                            .query_one_or_none(&query, &[&config.network, &config.detail_key])
+                            .await
+                        {
+                            Ok(Some(row)) => read_cursor(row),
+                            Ok(None) => fallback.resume_from,
+                            Err(error) => {
+                                error!("Error fetching seeded detail cursor: {:?}", error);
+                                fallback.resume_from
+                            }
+                        }
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        error!("Error fetching legacy last synced block: {:?}", error);
+                        None
+                    }
                 }
             }
-            Err(e) => {
-                error!("Error fetching last synced block: {:?}", e);
+            Ok(None) => None,
+            Err(error) => {
+                error!("Error fetching last synced block: {:?}", error);
                 None
             }
         };
     }
 
-    // Query database for last synced block
+    // ClickHouse remains event-scoped. Existing MergeTree primary keys cannot be changed without
+    // rewriting each table, so PostgreSQL is the only self-migrating per-detail backend.
     if let Some(clickhouse) = config.clickhouse {
         #[derive(Row, Deserialize)]
         struct LastBlock {
@@ -311,15 +381,22 @@ pub async fn update_progress_and_last_synced_task(
             generate_indexer_contract_schema_name(&config.indexer_name(), &config.contract_name());
         let table_name = generate_internal_event_table_name(&schema, &config.event_name());
         let network = &config.network_contract().network;
-        let query = format!(
-            "UPDATE rindexer_internal.{table_name} SET last_synced_block = {to_block} WHERE network = '{network}' AND {to_block} > last_synced_block;
-             UPDATE rindexer_internal.latest_block SET block = {latest} WHERE network = '{network}' AND {latest} > block;"
-        );
+        let detail_key = config.detail_key();
+        let query = postgres_cursor_upsert_query(&table_name);
 
-        let result = postgres.batch_execute(&query).await;
+        let result = postgres
+            .execute(&query, &[&network, &detail_key, &EthereumSqlTypeWrapper::U64(to_block.to())])
+            .await;
 
         if let Err(e) = result {
             error!("Error updating db last synced block: {:?}", e);
+        }
+        let latest_query =
+            "UPDATE rindexer_internal.latest_block SET block = $1 WHERE network = $2 AND $1 > block";
+        if let Err(e) =
+            postgres.execute(latest_query, &[&EthereumSqlTypeWrapper::U64(latest), &network]).await
+        {
+            error!("Error updating db latest block: {:?}", e);
         }
     } else if let Some(clickhouse) = &config.clickhouse() {
         let schema =
@@ -382,6 +459,38 @@ pub async fn update_progress_and_last_synced_task(
     on_complete();
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        legacy_cursor_fallback, postgres_cursor_seed_query, postgres_cursor_select_query,
+        postgres_cursor_upsert_query,
+    };
+    use alloy::primitives::U64;
+
+    #[test]
+    fn missing_detail_cursor_falls_back_to_legacy_and_is_seeded() {
+        let legacy = U64::from(42);
+        let fallback = legacy_cursor_fallback(legacy);
+
+        assert_eq!(fallback.resume_from, Some(legacy));
+        assert_eq!(fallback.seed, legacy);
+        assert!(postgres_cursor_select_query("cursor")
+            .contains("WHERE network = $1 AND detail_key = $2"));
+        assert!(postgres_cursor_seed_query("cursor")
+            .contains("ON CONFLICT (network, detail_key) DO NOTHING"));
+    }
+
+    #[test]
+    fn detail_cursor_update_is_monotonic_and_keyed_only_to_that_detail() {
+        let query = postgres_cursor_upsert_query("cursor");
+
+        assert!(query.contains("VALUES ($1, $2, $3)"));
+        assert!(query.contains("ON CONFLICT (network, detail_key)"));
+        assert!(query.contains("GREATEST("));
+        assert!(!query.contains("__event__"));
+    }
+}
+
 pub async fn evm_trace_update_progress_and_last_synced_task(
     config: Arc<TraceProcessingConfig>,
     to_block: U64,
@@ -406,7 +515,7 @@ pub async fn evm_trace_update_progress_and_last_synced_task(
             generate_indexer_contract_schema_name(&config.indexer_name, &config.contract_name);
         let table_name = generate_internal_event_table_name(&schema, "native_transfer");
         let query = format!(
-                "UPDATE rindexer_internal.{table_name} SET last_synced_block = $1 WHERE network = $2 AND $1 > last_synced_block"
+                "UPDATE rindexer_internal.{table_name} SET last_synced_block = $1 WHERE network = $2 AND detail_key = '__event__' AND $1 > last_synced_block"
             );
         let result = postgres
             .execute(&query, &[&EthereumSqlTypeWrapper::U64(to_block.to()), &config.network])

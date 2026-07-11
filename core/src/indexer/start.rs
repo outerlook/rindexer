@@ -21,7 +21,9 @@ use crate::{
     database::postgres::client::PostgresConnectionError,
     event::{
         callback_registry::{EventCallbackRegistry, TraceCallbackRegistry},
-        config::{EventProcessingConfig, TraceProcessingConfig},
+        config::{
+            derive_detail_key, EventProcessingConfig, TraceProcessingConfig, LEGACY_DETAIL_KEY,
+        },
     },
     indexer::{
         dependency::ContractEventsDependenciesConfig,
@@ -234,6 +236,7 @@ async fn start_indexing_traces(
             contract_name: &first_event.contract_name,
             event_name: &first_event.event_name,
             network: &network_name,
+            detail_key: LEGACY_DETAIL_KEY,
         };
 
         let (block_tx, block_rx) = tokio::sync::mpsc::channel(4096);
@@ -349,6 +352,8 @@ async fn start_indexing_contract_events(
             let dependencies = dependencies.to_vec();
 
             block_tasks.push(async move {
+                let detail_key =
+                    derive_detail_key(&network_contract.indexing_contract_setup, &event.event_name);
                 let config = SyncConfig {
                     project_path: &project_path,
                     postgres: &postgres,
@@ -360,6 +365,7 @@ async fn start_indexing_contract_events(
                     contract_name: &event.contract.name,
                     event_name: &event.event_name,
                     network: &network_contract.network,
+                    detail_key: &detail_key,
                 };
 
                 let result = get_start_end_block(

@@ -91,12 +91,48 @@ fn generate_internal_event_table_sql(
         let table_name = generate_internal_event_table_name(schema_name, &event_info.name);
 
         let create_table_query = format!(
-            r#"CREATE TABLE IF NOT EXISTS rindexer_internal.{table_name} ("network" TEXT PRIMARY KEY, "last_synced_block" NUMERIC);"#
+            r#"
+            CREATE TABLE IF NOT EXISTS rindexer_internal.{table_name} (
+                "network" TEXT NOT NULL,
+                "detail_key" TEXT NOT NULL DEFAULT '__event__',
+                "last_synced_block" NUMERIC,
+                PRIMARY KEY ("network", "detail_key")
+            );
+            ALTER TABLE rindexer_internal.{table_name}
+                ADD COLUMN IF NOT EXISTS "detail_key" TEXT NOT NULL DEFAULT '__event__';
+            DO $detail_cursor_migration$
+            DECLARE
+                current_primary_key RECORD;
+            BEGIN
+                SELECT conname, pg_get_constraintdef(oid) AS definition
+                INTO current_primary_key
+                FROM pg_constraint
+                WHERE conrelid = 'rindexer_internal.{table_name}'::regclass AND contype = 'p';
+
+                IF current_primary_key.conname IS NOT NULL
+                    AND current_primary_key.definition <> 'PRIMARY KEY (network, detail_key)'
+                THEN
+                    EXECUTE format(
+                        'ALTER TABLE rindexer_internal.{table_name} DROP CONSTRAINT %I',
+                        current_primary_key.conname
+                    );
+                END IF;
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'rindexer_internal.{table_name}'::regclass AND contype = 'p'
+                ) THEN
+                    ALTER TABLE rindexer_internal.{table_name}
+                        ADD PRIMARY KEY ("network", "detail_key");
+                END IF;
+            END
+            $detail_cursor_migration$;
+            "#
         );
 
         let insert_queries = networks.iter().map(|network| {
             format!(
-                r#"INSERT INTO rindexer_internal.{table_name} ("network", "last_synced_block") VALUES ('{network}', 0) ON CONFLICT ("network") DO NOTHING;"#,
+                r#"INSERT INTO rindexer_internal.{table_name} ("network", "detail_key", "last_synced_block") VALUES ('{network}', '__event__', 0) ON CONFLICT ("network", "detail_key") DO NOTHING;"#,
             )
         }).collect::<Vec<_>>().join("\n");
 
