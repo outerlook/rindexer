@@ -585,6 +585,7 @@ serde = {{ version = "1.0", features = ["derive"] }}
                             Ok(_) => {}
                             Err(e) => {
                                 println!("Error starting rindexer: {:?}", e);
+                                std::process::exit(1);
                             }
                         }
                     }

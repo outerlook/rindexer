@@ -42,10 +42,22 @@ pub fn fetch_logs_stream(
 
     debug!("{} Configured with {} event buffer", config.info_log_name(), channel_size);
 
-    let (tx, rx) = mpsc::channel(channel_size);
+    let (tx, rx) = mpsc::channel::<Result<FetchLogsResult, Box<dyn Error + Send>>>(channel_size);
 
     tokio::spawn(async move {
-        let mut current_filter = config.to_event_filter().unwrap();
+        let mut current_filter = match config.to_event_filter() {
+            Ok(filter) => filter,
+            Err(error) => {
+                let error = ProviderError::CustomError(format!(
+                    "{} - could not build logs filter for detail {}: {}",
+                    config.info_log_name(),
+                    config.detail_key(),
+                    error
+                ));
+                let _ = tx.send(Err(Box::new(error))).await;
+                return;
+            }
+        };
 
         let snapshot_to_block = current_filter.to_block();
         let from_block = current_filter.from_block();
@@ -285,10 +297,17 @@ async fn fetch_historic_logs_stream(
             }
 
             if let Some(last_log) = last_log {
-                let next_from_block = U64::from(
-                    last_log.block_number.expect("block number should always be present in a log")
-                        + 1,
-                );
+                let Some(last_log_block_number) = last_log.block_number else {
+                    error!(
+                        "{} - Failed to get last log block number because the provider returned null; retrying the range",
+                        info_log_name
+                    );
+                    return Some(ProcessHistoricLogsStreamResult {
+                        next: current_filter,
+                        max_block_range_limitation,
+                    });
+                };
+                let next_from_block = U64::from(last_log_block_number + 1);
                 debug!(
                     "{} - {} - next_block {:?}",
                     info_log_name,

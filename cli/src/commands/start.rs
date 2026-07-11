@@ -549,9 +549,10 @@ pub async fn start(
                     },
                 };
 
-                let _ = start_rindexer_no_code(details).await.map_err(|e| {
+                start_rindexer_no_code(details).await.map_err(|e| {
                     print_error_message(&format!("Error starting the server: {e}"));
-                });
+                    e
+                })?;
             }
         },
     }

@@ -105,11 +105,33 @@ async fn process_event_logs(
         }
     }
 
+    ensure_logs_stream_end_is_expected(
+        config.live_indexing(),
+        force_no_live_indexing,
+        &config.info_log_name(),
+        &config.detail_key(),
+    )?;
+
     // Wait for all remaining tasks to complete
     if !tasks.is_empty() {
         futures::future::try_join_all(tasks)
             .await
             .map_err(|e| Box::new(ProviderError::CustomError(e.to_string())))?;
+    }
+
+    Ok(())
+}
+
+fn ensure_logs_stream_end_is_expected(
+    live_indexing: bool,
+    force_no_live_indexing: bool,
+    info_log_name: &str,
+    detail_key: &str,
+) -> Result<(), Box<ProviderError>> {
+    if live_indexing && !force_no_live_indexing {
+        return Err(Box::new(ProviderError::CustomError(format!(
+            "{info_log_name} - live logs stream ended unexpectedly for detail {detail_key}"
+        ))));
     }
 
     Ok(())
@@ -675,5 +697,32 @@ async fn handle_logs_result(
             );
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_logs_stream_end_is_expected;
+
+    #[test]
+    fn live_stream_eof_returns_an_identified_error() {
+        let error = ensure_logs_stream_end_is_expected(
+            true,
+            false,
+            "WalletERC20Transfers::Transfer::mainnet",
+            "0xabc:i1:0xwallet",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("WalletERC20Transfers::Transfer::mainnet"));
+        assert!(error.contains("0xabc:i1:0xwallet"));
+        assert!(error.contains("live logs stream ended unexpectedly"));
+    }
+
+    #[test]
+    fn finite_and_forced_historical_stream_eof_are_successful() {
+        assert!(ensure_logs_stream_end_is_expected(false, false, "event", "detail").is_ok());
+        assert!(ensure_logs_stream_end_is_expected(true, true, "event", "detail").is_ok());
     }
 }
