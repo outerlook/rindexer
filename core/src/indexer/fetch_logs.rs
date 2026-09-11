@@ -589,11 +589,15 @@ async fn live_indexing_stream(
 
                             let contract_address = current_filter.contract_addresses().await;
 
-                            if from_block == to_block
+                            // A Bloom-proven empty singleton skips the getLogs RPC but still
+                            // flows through the shared consumer path below so durable
+                            // progress advances. The Bloom check is only valid when the
+                            // range is exactly the latest block whose header was checked.
+                            let bloom_proven_empty = from_block == to_block
                                 && to_block == latest_block_number
                                 && !disable_logs_bloom_checks
-                                && !is_relevant_block(&contract_address, topic_id, &latest_block)
-                            {
+                                && !is_relevant_block(&contract_address, topic_id, &latest_block);
+                            if bloom_proven_empty {
                                 debug!(
                                     "{} - {} - Skipping block {} as it's not relevant",
                                     info_log_name,
@@ -606,10 +610,8 @@ async fn live_indexing_stream(
                                         IndexingEventProgressStatus::Live.log(),
                                         from_block
                                     );
-                                current_filter =
-                                    current_filter.set_from_block(to_block + U64::from(1));
-                                last_seen_block_number = to_block;
-                            } else {
+                            }
+                            {
                                 current_filter = current_filter.set_to_block(to_block);
 
                                 debug!(
@@ -619,7 +621,12 @@ async fn live_indexing_stream(
                                     current_filter
                                 );
 
-                                match cached_provider.get_logs(&current_filter).await {
+                                let logs_result = if bloom_proven_empty {
+                                    Ok(Vec::new())
+                                } else {
+                                    cached_provider.get_logs(&current_filter).await
+                                };
+                                match logs_result {
                                     Ok(logs) => {
                                         debug!(
                                             "{} - {} - Live topic_id {}, Logs: {} from {} to {}",

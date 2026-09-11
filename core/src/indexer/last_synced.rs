@@ -103,7 +103,7 @@ fn postgres_cursor_seed_query(table_name: &str) -> String {
     )
 }
 
-fn postgres_cursor_upsert_query(table_name: &str) -> String {
+pub(crate) fn postgres_cursor_upsert_query(table_name: &str) -> String {
     format!(
         "INSERT INTO rindexer_internal.{table_name} (network, detail_key, last_synced_block) VALUES ($1, $2, $3) ON CONFLICT (network, detail_key) DO UPDATE SET last_synced_block = GREATEST(rindexer_internal.{table_name}.last_synced_block, EXCLUDED.last_synced_block)"
     )
