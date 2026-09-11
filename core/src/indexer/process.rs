@@ -463,14 +463,20 @@ async fn live_indexing_for_contract_event_dependencies(
             }
 
             let to_block = safe_block_number;
-            if from_block == to_block
+            // A Bloom-proven empty singleton skips the getLogs RPC but still flows
+            // through the shared consumer path below so durable progress advances.
+            // The latest block header's Bloom is only valid when the safe range ends
+            // exactly at the latest block; with a reorg distance the safe head is
+            // older and must always be queried.
+            let bloom_proven_empty = from_block == to_block
+                && to_block == latest_block_number
                 && !config.network_contract().disable_logs_bloom_checks
                 && !is_relevant_block(
                     &ordering_live_indexing_details.filter.contract_addresses().await,
                     &config.topic_id(),
                     &latest_block,
-                )
-            {
+                );
+            if bloom_proven_empty {
                 debug!(
                     "{} - {} - Skipping block {} as it's not relevant",
                     &config.info_log_name(),
@@ -483,17 +489,6 @@ async fn live_indexing_for_contract_event_dependencies(
                     IndexingEventProgressStatus::Live.log(),
                     from_block
                 );
-
-                ordering_live_indexing_details.filter =
-                    ordering_live_indexing_details.filter.set_from_block(to_block + U64::from(1));
-
-                ordering_live_indexing_details.last_seen_block_number = to_block;
-                *ordering_live_indexing_details_map
-                    .get(&config.id())
-                    .expect("Failed to get ordering_live_indexing_details_map")
-                    .lock()
-                    .await = ordering_live_indexing_details;
-                continue;
             }
 
             ordering_live_indexing_details.filter =
@@ -506,7 +501,12 @@ async fn live_indexing_for_contract_event_dependencies(
                 ordering_live_indexing_details.filter
             );
 
-            match cached_provider.get_logs(&ordering_live_indexing_details.filter).await {
+            let logs_result = if bloom_proven_empty {
+                Ok(Vec::new())
+            } else {
+                cached_provider.get_logs(&ordering_live_indexing_details.filter).await
+            };
+            match logs_result {
                 Ok(logs) => {
                     debug!(
                         "{} - {} - Live id {} topic_id {}, Logs: {} from {} to {}",
@@ -724,5 +724,665 @@ mod tests {
     fn finite_and_forced_historical_stream_eof_are_successful() {
         assert!(ensure_logs_stream_end_is_expected(false, false, "event", "detail").is_ok());
         assert!(ensure_logs_stream_end_is_expected(true, true, "event", "detail").is_ok());
+    }
+
+    use std::any::Any;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use alloy::network::AnyRpcBlock;
+    use alloy::primitives::{Address, Bloom, Bytes, TxHash, B256, U64};
+    use alloy::rpc::types::ValueOrArray;
+    use axum::{extract::State, routing::post, Json, Router};
+    use tokio::net::TcpListener;
+    use tokio::sync::RwLock;
+    use tokio::task::JoinHandle;
+    use tokio::time::Instant;
+
+    use super::*;
+    use crate::blockclock::BlockClock;
+    use crate::database::generate::generate_indexer_contract_schema_name;
+    use crate::database::postgres::generate::generate_internal_event_table_name;
+    use crate::event::callback_registry::EventCallbackRegistry;
+    use crate::event::config::{ContractEventProcessingConfig, EventProcessingConfig};
+    use crate::event::contract_setup::{AddressDetails, IndexingContractSetup, NetworkContract};
+    use crate::indexer::last_synced::{
+        get_last_synced_block_number, postgres_cursor_upsert_query, SyncConfig,
+    };
+    use crate::indexer::progress::IndexingEventsProgressState;
+    use crate::manifest::config::Config;
+    use crate::manifest::network::BlockPollFrequency;
+    use crate::{EthereumSqlTypeWrapper, PostgresClient};
+
+    static TEST_INDEXER_SEQ: AtomicUsize = AtomicUsize::new(1);
+
+    fn make_test_block(number: u64, bloom: Bloom) -> AnyRpcBlock {
+        let mut block = AnyRpcBlock::new(Default::default());
+        block.header.number = number;
+        block.header.timestamp = 1_700_000_000 + number;
+        block.header.logs_bloom = bloom;
+        block
+    }
+
+    struct MockRpcState {
+        chain_id: u64,
+        current_block: RwLock<AnyRpcBlock>,
+        block_request_count: AtomicUsize,
+        logs_request_count: AtomicUsize,
+        last_log_request_from: AtomicU64,
+        last_log_request_to: AtomicU64,
+    }
+
+    impl MockRpcState {
+        fn new(chain_id: u64, initial_block: AnyRpcBlock) -> Self {
+            Self {
+                chain_id,
+                current_block: RwLock::new(initial_block),
+                block_request_count: AtomicUsize::new(0),
+                logs_request_count: AtomicUsize::new(0),
+                last_log_request_from: AtomicU64::new(0),
+                last_log_request_to: AtomicU64::new(0),
+            }
+        }
+
+        async fn handle_rpc(&self, req: &serde_json::Value) -> serde_json::Value {
+            let id = req.get("id").cloned().unwrap_or(serde_json::json!(1));
+            let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+
+            match method {
+                "eth_chainId" => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": format!("0x{:x}", self.chain_id)
+                }),
+                "net_version" => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": self.chain_id.to_string()
+                }),
+                "eth_getBlockByNumber" => {
+                    self.block_request_count.fetch_add(1, Ordering::SeqCst);
+                    let block = self.current_block.read().await.clone();
+                    let block_val = serde_json::to_value(&block).unwrap_or(serde_json::Value::Null);
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": block_val
+                    })
+                }
+                "eth_getLogs" => {
+                    self.logs_request_count.fetch_add(1, Ordering::SeqCst);
+                    if let Some(params) = req.get("params").and_then(|p| p.as_array()) {
+                        if let Some(filter) = params.first() {
+                            let from_hex =
+                                filter.get("fromBlock").and_then(|v| v.as_str()).unwrap_or("");
+                            let to_hex =
+                                filter.get("toBlock").and_then(|v| v.as_str()).unwrap_or("");
+                            let from = u64::from_str_radix(from_hex.trim_start_matches("0x"), 16)
+                                .unwrap_or(0);
+                            let to = u64::from_str_radix(to_hex.trim_start_matches("0x"), 16)
+                                .unwrap_or(0);
+                            if from == 0 || to == 0 || from > to {
+                                return serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": {
+                                        "code": -32602,
+                                        "message": format!(
+                                            "Invalid block range in eth_getLogs: from={} to={}",
+                                            from, to
+                                        )
+                                    }
+                                });
+                            }
+                            self.last_log_request_from.store(from, Ordering::SeqCst);
+                            self.last_log_request_to.store(to, Ordering::SeqCst);
+                        }
+                    }
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": []
+                    })
+                }
+                other => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("Method not found or unexpected in test mock: {}", other)
+                    }
+                }),
+            }
+        }
+    }
+
+    async fn rpc_handler(
+        State(state): State<Arc<MockRpcState>>,
+        Json(payload): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        if let Some(batch) = payload.as_array() {
+            let mut responses = Vec::with_capacity(batch.len());
+            for req in batch {
+                responses.push(state.handle_rpc(req).await);
+            }
+            Json(serde_json::Value::Array(responses))
+        } else {
+            Json(state.handle_rpc(&payload).await)
+        }
+    }
+
+    /// Shared fixture for the PostgreSQL-backed live-indexing tests below.
+    ///
+    /// These tests are explicit opt-in: run them with an isolated endpoint via
+    /// `cargo test -p rindexer --lib indexer::process::tests -- --include-ignored`.
+    struct TestFixture {
+        rpc_state: Arc<MockRpcState>,
+        server_handle: JoinHandle<()>,
+        postgres: Arc<PostgresClient>,
+        table_name: String,
+        network: String,
+        detail_key: String,
+        config: Arc<EventProcessingConfig>,
+        cached_provider: Arc<JsonRpcCachedProvider>,
+    }
+
+    impl TestFixture {
+        async fn new(disable_logs_bloom_checks: bool, initial_cursor: u64) -> Self {
+            Self::new_with_distance(disable_logs_bloom_checks, initial_cursor, 0).await
+        }
+
+        async fn new_with_distance(
+            disable_logs_bloom_checks: bool,
+            initial_cursor: u64,
+            reorg_distance: u64,
+        ) -> Self {
+            let _ = std::env::var("DATABASE_URL")
+                .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+                .expect(
+                    "DATABASE_URL must be provided to run the real PostgreSQL durable cursor test. Main will supply an isolated endpoint."
+                );
+
+            let postgres = Arc::new(
+                PostgresClient::new()
+                    .await
+                    .expect("Failed to connect to PostgreSQL with DATABASE_URL"),
+            );
+
+            let seq = TEST_INDEXER_SEQ.fetch_add(1, Ordering::SeqCst);
+            let indexer_name = format!("test_bloom_repro_{}", seq);
+            let contract_name = "TestContract".to_string();
+            let event_name = "Transfer".to_string();
+            let network = "ethereum".to_string();
+
+            let block_101 = make_test_block(101, Bloom::ZERO);
+            let rpc_state = Arc::new(MockRpcState::new(1, block_101));
+
+            let app =
+                Router::new().route("/", post(rpc_handler)).with_state(Arc::clone(&rpc_state));
+            let listener =
+                TcpListener::bind("127.0.0.1:0").await.expect("Failed to bind mock rpc listener");
+            let addr = listener.local_addr().expect("Failed to get local addr");
+            let server_handle = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let rpc_url = format!("http://{}", addr);
+
+            let cached_provider = crate::provider::create_client(
+                &rpc_url,
+                1,
+                None,
+                None,
+                Some(BlockPollFrequency::PollRateMs { millis: 5 }),
+                reqwest::header::HeaderMap::new(),
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to create cached provider");
+
+            let contract_address = Address::repeat_byte(0x42);
+            let topic_id = B256::repeat_byte(0xbb);
+
+            let decoder = Arc::new(|_topics: Vec<TxHash>, _data: Bytes| {
+                Arc::new(()) as Arc<dyn Any + Send + Sync>
+            });
+
+            let network_contract = Arc::new(NetworkContract {
+                id: format!("{}-{}-{}", indexer_name, contract_name, network),
+                network: network.clone(),
+                indexing_contract_setup: IndexingContractSetup::Address(AddressDetails {
+                    address: ValueOrArray::Value(contract_address),
+                    indexed_filters: None,
+                }),
+                cached_provider: Arc::clone(&cached_provider),
+                block_clock: BlockClock::new(Some(false), None, Arc::clone(&cached_provider)),
+                decoder,
+                start_block: Some(U64::from(101)),
+                end_block: None,
+                disable_logs_bloom_checks,
+            });
+
+            let config = Arc::new(EventProcessingConfig::ContractEventProcessing(
+                ContractEventProcessingConfig {
+                    id: format!("{}-{}-{}", indexer_name, contract_name, event_name),
+                    project_path: Path::new("/tmp").to_path_buf(),
+                    indexer_name: indexer_name.clone(),
+                    contract_name: contract_name.clone(),
+                    topic_id,
+                    event_name: event_name.clone(),
+                    config: Config::default(),
+                    network_contract: Arc::clone(&network_contract),
+                    timestamps: false,
+                    start_block: U64::from(101),
+                    end_block: U64::from(100), // historical drained (from > to)
+                    registry: Arc::new(EventCallbackRegistry::new()),
+                    progress: Arc::new(tokio::sync::Mutex::new(IndexingEventsProgressState {
+                        events: Vec::new(),
+                    })),
+                    postgres: Some(Arc::clone(&postgres)),
+                    clickhouse: None,
+                    csv_details: None,
+                    stream_last_synced_block_file_path: None,
+                    index_event_in_order: false,
+                    live_indexing: true,
+                    indexing_distance_from_head: U64::from(reorg_distance),
+                },
+            ));
+
+            let schema = generate_indexer_contract_schema_name(
+                &config.indexer_name(),
+                &config.contract_name(),
+            );
+            let table_name = generate_internal_event_table_name(&schema, &config.event_name());
+            let detail_key = config.detail_key();
+
+            postgres
+                .batch_execute(&format!(
+                    r#"
+                    CREATE SCHEMA IF NOT EXISTS rindexer_internal;
+                    CREATE TABLE IF NOT EXISTS rindexer_internal.latest_block (
+                        "network" TEXT PRIMARY KEY,
+                        "block" NUMERIC
+                    );
+                    CREATE TABLE IF NOT EXISTS rindexer_internal.{table_name} (
+                        "network" TEXT NOT NULL,
+                        "detail_key" TEXT NOT NULL DEFAULT '__event__',
+                        "last_synced_block" NUMERIC,
+                        PRIMARY KEY ("network", "detail_key")
+                    );
+                    DELETE FROM rindexer_internal.{table_name} WHERE network = '{network}' AND detail_key = '{detail_key}';
+                    "#
+                ))
+                .await
+                .expect("Failed to initialize test table in PostgreSQL");
+
+            postgres
+                .execute(
+                    &postgres_cursor_upsert_query(&table_name),
+                    &[&network, &detail_key, &EthereumSqlTypeWrapper::U64(initial_cursor)],
+                )
+                .await
+                .expect("Failed to seed initial cursor C in PostgreSQL");
+
+            Self {
+                rpc_state,
+                server_handle,
+                postgres,
+                table_name,
+                network,
+                detail_key,
+                config,
+                cached_provider,
+            }
+        }
+
+        fn reset_request_counters(&self) {
+            self.rpc_state.block_request_count.store(0, Ordering::SeqCst);
+            self.rpc_state.logs_request_count.store(0, Ordering::SeqCst);
+            self.rpc_state.last_log_request_from.store(0, Ordering::SeqCst);
+            self.rpc_state.last_log_request_to.store(0, Ordering::SeqCst);
+        }
+
+        async fn read_persisted_cursor(&self) -> Option<U64> {
+            get_last_synced_block_number(SyncConfig {
+                project_path: Path::new("/tmp"),
+                postgres: &Some(Arc::clone(&self.postgres)),
+                clickhouse: &None,
+                csv_details: &None,
+                stream_details: &None,
+                contract_csv_enabled: false,
+                indexer_name: &self.config.indexer_name(),
+                contract_name: &self.config.contract_name(),
+                event_name: &self.config.event_name(),
+                network: &self.network,
+                detail_key: &self.detail_key,
+            })
+            .await
+        }
+
+        async fn wait_for_block_requests(&self, min_count: usize, timeout: Duration) -> bool {
+            let start = Instant::now();
+            while start.elapsed() < timeout {
+                if self.rpc_state.block_request_count.load(Ordering::SeqCst) >= min_count {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            false
+        }
+
+        async fn wait_for_log_requests(&self, min_count: usize, timeout: Duration) -> bool {
+            let start = Instant::now();
+            while start.elapsed() < timeout {
+                if self.rpc_state.logs_request_count.load(Ordering::SeqCst) >= min_count {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            false
+        }
+
+        async fn tear_down(self) {
+            let _ = self
+                .postgres
+                .batch_execute(&format!(
+                    "DROP TABLE IF EXISTS rindexer_internal.{} CASCADE;",
+                    self.table_name
+                ))
+                .await;
+            self.server_handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL DATABASE_URL"]
+    async fn test_live_bloom_skip_persists_skipped_cursor_without_get_logs() {
+        // Starts with drained work and initial cursor C = 100.
+        // Head B = 101 has Bloom::ZERO (irrelevant), with Bloom skipping enabled.
+        // The Bloom-proven empty range must advance the durable cursor through the
+        // normal consumer path, without a getLogs RPC.
+        let fixture = TestFixture::new(false, 100).await;
+        assert_eq!(fixture.read_persisted_cursor().await, Some(U64::from(100)));
+
+        // Reset request counters immediately before running the live loop so counts
+        // are strictly attributable to the loop's iterations.
+        fixture.reset_request_counters();
+
+        let handle = tokio::spawn({
+            let config = Arc::clone(&fixture.config);
+            async move {
+                let _ = process_event_logs(config, false, false).await;
+            }
+        });
+
+        // Wait until live loop has completed iteration 1 (skipped block 101) and commenced iteration 2
+        let reached = fixture.wait_for_block_requests(2, Duration::from_secs(5)).await;
+        assert!(reached, "Expected at least 2 get_block requests from live loop");
+
+        // Await durable cursor convergence instead of racing async persistence.
+        let mut persisted = None;
+        for _ in 0..100 {
+            persisted = fixture.read_persisted_cursor().await;
+            if persisted == Some(U64::from(101)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let log_reqs = fixture.rpc_state.logs_request_count.load(Ordering::SeqCst);
+        handle.abort();
+        fixture.tear_down().await;
+
+        assert_eq!(log_reqs, 0, "Bloom-proven empty block 101 must not trigger a getLogs RPC");
+        assert_eq!(
+            persisted,
+            Some(U64::from(101)),
+            "Bloom-proven empty block B=101 must advance the durable cursor from C=100"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL DATABASE_URL"]
+    async fn test_control_live_bloom_skip_disabled_persists_empty_block() {
+        // Discriminating control: disable Bloom skipping (disable_logs_bloom_checks = true).
+        // Head B = 101 returns empty getLogs result; real consumer MUST persist B without an event row.
+        let fixture = TestFixture::new(true, 100).await;
+        assert_eq!(fixture.read_persisted_cursor().await, Some(U64::from(100)));
+
+        fixture.reset_request_counters();
+
+        let handle = tokio::spawn({
+            let config = Arc::clone(&fixture.config);
+            async move {
+                let _ = process_event_logs(config, false, false).await;
+            }
+        });
+
+        let reached = fixture.wait_for_log_requests(1, Duration::from_secs(5)).await;
+        assert!(reached, "Expected getLogs request for block 101");
+        assert_eq!(fixture.rpc_state.last_log_request_from.load(Ordering::SeqCst), 101);
+        assert_eq!(fixture.rpc_state.last_log_request_to.load(Ordering::SeqCst), 101);
+
+        let mut persisted = None;
+        for _ in 0..100 {
+            persisted = fixture.read_persisted_cursor().await;
+            if persisted == Some(U64::from(101)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        handle.abort();
+        fixture.tear_down().await;
+
+        // On current source, this PASSES:
+        assert_eq!(
+            persisted,
+            Some(U64::from(101)),
+            "CONTROL CONFIRMED: When Bloom checks are disabled, consumer persists block B=101 without event rows"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL DATABASE_URL"]
+    async fn test_control_live_stream_catches_up_after_bloom_skip() {
+        // Shows that a subsequent non-skipped empty range catches up after the skip,
+        // proving this is not a stopped or deadlocked stream.
+        let fixture = TestFixture::new(false, 100).await;
+        assert_eq!(fixture.read_persisted_cursor().await, Some(U64::from(100)));
+
+        fixture.reset_request_counters();
+
+        let handle = tokio::spawn({
+            let config = Arc::clone(&fixture.config);
+            async move {
+                let _ = process_event_logs(config, false, false).await;
+            }
+        });
+
+        // 1. Block 101 is Bloom-proven empty: no getLogs, but cursor converges to 101
+        let reached_101 = fixture.wait_for_block_requests(2, Duration::from_secs(5)).await;
+        assert!(reached_101);
+        let mut after_skip = None;
+        for _ in 0..100 {
+            after_skip = fixture.read_persisted_cursor().await;
+            if after_skip == Some(U64::from(101)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(after_skip, Some(U64::from(101)));
+
+        // 2. Supply next head B+1 = 102 with relevant Bloom (all bits set)
+        let block_102 = make_test_block(102, Bloom::repeat_byte(0xff));
+        *fixture.rpc_state.current_block.write().await = block_102;
+
+        // 3. Wait for block 102 to be queried via getLogs
+        let reached_102 = fixture.wait_for_log_requests(1, Duration::from_secs(5)).await;
+        assert!(reached_102, "Block 102 should trigger getLogs request");
+        assert_eq!(fixture.rpc_state.last_log_request_from.load(Ordering::SeqCst), 102);
+        assert_eq!(fixture.rpc_state.last_log_request_to.load(Ordering::SeqCst), 102);
+
+        let mut persisted = None;
+        for _ in 0..100 {
+            persisted = fixture.read_persisted_cursor().await;
+            if persisted == Some(U64::from(102)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        handle.abort();
+        fixture.tear_down().await;
+
+        // On fixed source, this PASSES:
+        assert_eq!(
+            persisted,
+            Some(U64::from(102)),
+            "CATCH-UP CONFIRMED: cursor advanced 100 -> 101 on the Bloom-proven empty block, then to 102 on the subsequent non-skipped block"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL DATABASE_URL"]
+    async fn test_dependency_ordered_bloom_skip_regression_and_control() {
+        // Covers the analogous dependency-ordered skip path in live_indexing_for_contract_event_dependencies.
+
+        // Case A: Bloom skip enabled -> cursor still advances to 101 through the
+        // consumer path, without a getLogs RPC (fixed regression)
+        {
+            let fixture = TestFixture::new(false, 100).await;
+            let filter = fixture
+                .config
+                .to_event_filter()
+                .expect("event filter")
+                .set_to_block(U64::from(100));
+            let dep_config = EventDependenciesIndexingConfig {
+                cached_provider: Arc::clone(&fixture.cached_provider),
+                events: vec![(Arc::clone(&fixture.config), filter)],
+                network: fixture.network.clone(),
+            };
+
+            fixture.reset_request_counters();
+
+            let handle = tokio::spawn(async move {
+                live_indexing_for_contract_event_dependencies(dep_config).await;
+            });
+
+            let reached = fixture.wait_for_block_requests(2, Duration::from_secs(5)).await;
+            assert!(reached);
+
+            // Await durable cursor convergence instead of racing async persistence.
+            let mut persisted = None;
+            for _ in 0..100 {
+                persisted = fixture.read_persisted_cursor().await;
+                if persisted == Some(U64::from(101)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let log_reqs = fixture.rpc_state.logs_request_count.load(Ordering::SeqCst);
+            handle.abort();
+            fixture.tear_down().await;
+
+            assert_eq!(log_reqs, 0, "Bloom-proven empty block must not trigger a getLogs RPC");
+            assert_eq!(
+                persisted,
+                Some(U64::from(101)),
+                "Dependency-ordered path must persist the Bloom-proven empty block to 101"
+            );
+        }
+
+        // Case B: Bloom skip disabled -> cursor advances to 101 (discriminating control)
+        {
+            let fixture = TestFixture::new(true, 100).await;
+            let filter = fixture
+                .config
+                .to_event_filter()
+                .expect("event filter")
+                .set_to_block(U64::from(100));
+            let dep_config = EventDependenciesIndexingConfig {
+                cached_provider: Arc::clone(&fixture.cached_provider),
+                events: vec![(Arc::clone(&fixture.config), filter)],
+                network: fixture.network.clone(),
+            };
+
+            fixture.reset_request_counters();
+
+            let handle = tokio::spawn(async move {
+                live_indexing_for_contract_event_dependencies(dep_config).await;
+            });
+
+            let reached = fixture.wait_for_log_requests(1, Duration::from_secs(5)).await;
+            assert!(reached);
+            assert_eq!(fixture.rpc_state.last_log_request_from.load(Ordering::SeqCst), 101);
+            assert_eq!(fixture.rpc_state.last_log_request_to.load(Ordering::SeqCst), 101);
+
+            let mut persisted = None;
+            for _ in 0..100 {
+                persisted = fixture.read_persisted_cursor().await;
+                if persisted == Some(U64::from(101)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            handle.abort();
+            fixture.tear_down().await;
+
+            assert_eq!(
+                persisted,
+                Some(U64::from(101)),
+                "Dependency-ordered path persists cursor to 101 when Bloom checks are disabled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL DATABASE_URL"]
+    async fn test_dependency_ordered_safe_head_mismatch_always_queries() {
+        // With a reorg distance of 1, latest = 101 but safe head = 100. The Bloom of
+        // the latest header must NOT authorize skipping the older safe block: the
+        // range [100, 100] must be queried via getLogs and persisted.
+        let fixture = TestFixture::new_with_distance(false, 99, 1).await;
+        assert_eq!(fixture.read_persisted_cursor().await, Some(U64::from(99)));
+        let filter =
+            fixture.config.to_event_filter().expect("event filter").set_to_block(U64::from(99));
+        let dep_config = EventDependenciesIndexingConfig {
+            cached_provider: Arc::clone(&fixture.cached_provider),
+            events: vec![(Arc::clone(&fixture.config), filter)],
+            network: fixture.network.clone(),
+        };
+
+        fixture.reset_request_counters();
+
+        let handle = tokio::spawn(async move {
+            live_indexing_for_contract_event_dependencies(dep_config).await;
+        });
+
+        let reached = fixture.wait_for_log_requests(1, Duration::from_secs(5)).await;
+        assert!(reached, "Safe block 100 older than latest 101 must be queried via getLogs");
+        assert_eq!(fixture.rpc_state.last_log_request_from.load(Ordering::SeqCst), 100);
+        assert_eq!(fixture.rpc_state.last_log_request_to.load(Ordering::SeqCst), 100);
+
+        let mut persisted = None;
+        for _ in 0..100 {
+            persisted = fixture.read_persisted_cursor().await;
+            if persisted == Some(U64::from(100)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        handle.abort();
+        fixture.tear_down().await;
+
+        assert_eq!(
+            persisted,
+            Some(U64::from(100)),
+            "Safe-head/latest-header mismatch must query and persist block 100, never Bloom-skip it"
+        );
     }
 }
